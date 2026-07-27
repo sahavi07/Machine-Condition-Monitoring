@@ -1,0 +1,88 @@
+"""
+Flask Application API Server for Machine Condition Monitoring.
+Includes Health Checks, Data Ingestion, and CSV Seeding.
+"""
+
+import os
+import csv
+from datetime import datetime
+from flask import Flask, jsonify, request
+from models import db, MachineReading
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+app = Flask(__name__)
+
+# Application Configuration
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'default-fallback-secret-key')
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'sqlite:///instance/machine_monitoring.db')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# Initialize DB extension
+db.init_app(app)
+
+@app.before_request
+def create_tables_and_seed():
+    """Ensure DB tables exist and seed initial 40 records from CSV if empty."""
+    db.create_all()
+    if MachineReading.query.count() == 0:
+        csv_path = os.path.join(os.path.dirname(__file__), 'data', 'dataset.csv')
+        if os.path.exists(csv_path):
+            with open(csv_path, mode='r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                readings = []
+                for row in reader:
+                    # Parse temperature safely (handling missing values)
+                    temp_val = float(row['temperature']) if row['temperature'].strip() != '' else None
+                    
+                    # Parse ISO datetime
+                    recorded_dt = datetime.strptime(row['recorded_at'], "%Y-%m-%dT%H:%M:%SZ")
+
+                    reading = MachineReading(
+                        reading_id=int(row['reading_id']),
+                        machine_id=row['machine_id'],
+                        vibration=float(row['vibration']),
+                        temperature=temp_val,
+                        alert_flag=int(row['alert_flag']),
+                        recorded_at=recorded_dt
+                    )
+                    readings.append(reading)
+                
+                db.session.bulk_save_objects(readings)
+                db.session.commit()
+                print(f"[INFO] Database seeded with {len(readings)} records from {csv_path}")
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """
+    Health Check Endpoint required by Task 3.
+    Verifies API response capability and database connection health.
+    """
+    try:
+        # Perform simple query to verify database connection health
+        db.session.execute(db.select(1)).scalar()
+        return jsonify({
+            "status": "healthy"
+        }), 200
+    except Exception as e:
+        app.logger.error(f"Health check failed: {str(e)}")
+        return jsonify({
+            "status": "unhealthy",
+            "reason": str(e)
+        }), 500
+
+@app.route('/api/readings', methods=['GET'])
+def get_readings():
+    """Fetch all recorded machine telemetry readings."""
+    readings = MachineReading.query.order_by(MachineReading.reading_id.asc()).all()
+    return jsonify({
+        "status": "success",
+        "count": len(readings),
+        "data": [r.to_dict() for r in readings]
+    }), 200
+
+if __name__ == '__main__':
+    port = int(os.getenv('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)

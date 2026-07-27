@@ -1,0 +1,237 @@
+sih2026-machine-monitoring/
+│
+├── firmware/
+│   └── esp32_sensing_node.ino
+│
+├── data/
+│   ├── dataset.csv
+│   └── generate_dataset.py
+│
+├── instance/
+│   └── machine_monitoring.db
+│
+├── .dockerignore
+├── .env.example
+├── app.py
+├── docker-compose.yml
+├── Dockerfile
+├── models.py
+├── requirements.txt
+└── README.md
+/**
+ * SIH 2026 Machine Condition Monitoring Node
+ * Hardware Platform: ESP32 DevKit V1
+ * 
+ * Features:
+ * - Non-blocking timing using millis()
+ * - Moving average noise smoothing (Buffer N = 5)
+ * - Hardware out-of-range value rejection
+ * - Direct HTTP JSON payload posting to Flask backend
+ */
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+
+// ==========================================
+// Network & Server Configuration Settings
+// ==========================================
+const char* WIFI_SSID = "FACTORY_WIFI_NET";
+const char* WIFI_PASS = "IndustrialSecurity2026";
+const char* SERVER_URL = "http://192.168.1.100:5000/api/sensor-data";
+
+// Hardware Identity
+const char* MACHINE_ID = "MCH-01";
+
+// Pin Allocation
+const int VIBRATION_PIN = 34; // ADC1_CH6
+const int TEMP_PIN      = 35; // ADC1_CH7
+
+// Sampling & Transmission Intervals (Non-Blocking Timing)
+const unsigned long SAMPLE_INTERVAL_MS   = 1000; // Sample sensors every 1 sec
+const unsigned long TRANSMIT_INTERVAL_MS = 5000; // Send payload every 5 sec
+
+unsigned long lastSampleTime   = 0;
+unsigned long lastTransmitTime = 0;
+
+// ==========================================
+// Moving Average Filter Configuration
+// ==========================================
+const int FILTER_WINDOW_SIZE = 5;
+
+float vibBuffer[FILTER_WINDOW_SIZE]  = {0.0};
+float tempBuffer[FILTER_WINDOW_SIZE] = {0.0};
+int bufferIndex = 0;
+int sampleCount = 0;
+
+// Plausible Physical Range Boundaries
+const float MIN_TEMP = 0.0;     // deg C
+const float MAX_TEMP = 120.0;   // deg C
+const float MIN_VIB  = 0.0;     // mm/s
+const float MAX_VIB  = 20.0;    // mm/s
+
+/**
+ * Reads raw analog voltage and converts to scaled temperature value in deg C
+ */
+float readRawTemperature() {
+  int rawADC = analogRead(TEMP_PIN);
+  float voltage = (rawADC / 4095.0) * 3.3;
+  // Linear scale conversion: 0V = 0 deg C, 3.3V = 100 deg C (e.g., LM35/Analog Temp Sensor)
+  return voltage * 30.30;
+}
+
+/**
+ * Reads raw analog voltage and converts to RMS vibration velocity in mm/s
+ */
+float readRawVibration() {
+  int rawADC = analogRead(VIBRATION_PIN);
+  float voltage = (rawADC / 4095.0) * 3.3;
+  // Linear scale conversion: 0V = 0 mm/s, 3.3V = 10 mm/s
+  return voltage * 3.03;
+}
+
+/**
+ * Adds sample to moving average buffer after validation
+ */
+void sampleSensors() {
+  float rawVib  = readRawVibration();
+  float rawTemp = readRawTemperature();
+
+  // Validate values against plausible range boundaries
+  bool vibValid  = (rawVib >= MIN_VIB && rawVib <= MAX_VIB);
+  bool tempValid = (rawTemp >= MIN_TEMP && rawTemp <= MAX_TEMP);
+
+  if (vibValid && tempValid) {
+    vibBuffer[bufferIndex]  = rawVib;
+    tempBuffer[bufferIndex] = rawTemp;
+    
+    bufferIndex = (bufferIndex + 1) % FILTER_WINDOW_SIZE;
+    if (sampleCount < FILTER_WINDOW_SIZE) {
+      sampleCount++;
+    }
+    Serial.println("[SENSOR] Raw sample validated and added to window buffer.");
+  } else {
+    Serial.print("[REJECTED] Out-of-range sensor value detected! Raw Vib: ");
+    Serial.print(rawVib);
+    Serial.print(" mm/s | Raw Temp: ");
+    Serial.print(rawTemp);
+    Serial.println(" deg C");
+  }
+}
+
+/**
+ * Computes moving average from the rolling sample buffer
+ */
+bool getSmoothedReadings(float &avgVib, float &avgTemp) {
+  if (sampleCount == 0) {
+    return false; // No valid samples captured yet
+  }
+
+  float sumVib  = 0.0;
+  float sumTemp = 0.0;
+
+  for (int i = 0; i < sampleCount; i++) {
+    sumVib  += vibBuffer[i];
+    sumTemp += tempBuffer[i];
+  }
+
+  avgVib  = sumVib / sampleCount;
+  avgTemp = sumTemp / sampleCount;
+  return true;
+}
+
+/**
+ * Transmits moving average sensor readings via HTTP POST to Flask API
+ */
+void transmitData() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WIFI ERROR] Disconnected from network. Skipping transmission.");
+    return;
+  }
+
+  float avgVib = 0.0, avgTemp = 0.0;
+  if (!getSmoothedReadings(avgVib, avgTemp)) {
+    Serial.println("[SKIP] No valid sample data available to transmit.");
+    return;
+  }
+
+  HTTPClient http;
+  http.begin(SERVER_URL);
+  http.addHeader("Content-Type", "application/json");
+
+  // Construct JSON document
+  StaticJsonDocument<200> doc;
+  doc["machine_id"]  = MACHINE_ID;
+  doc["vibration"]   = round(avgVib * 100.0) / 100.0;   // Round to 2 decimals
+  doc["temperature"] = round(avgTemp * 10.0) / 10.0;   // Round to 1 decimal
+
+  String jsonPayload;
+  serializeJson(doc, jsonPayload);
+
+  Serial.print("[HTTP POST] Sending Payload: ");
+  Serial.println(jsonPayload);
+
+  int httpResponseCode = http.POST(jsonPayload);
+
+  if (httpResponseCode > 0) {
+    String response = http.getString();
+    Serial.printf("[HTTP SUCCESS] Response Code: %d | Body: %s\n", httpResponseCode, response.c_str());
+  } else {
+    Serial.printf("[HTTP ERROR] Failed code: %s\n", http.errorToString(httpResponseCode).c_str());
+  }
+
+  http.end();
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(VIBRATION_PIN, INPUT);
+  pinMode(TEMP_PIN, INPUT);
+
+  // Initialize WiFi connection
+  Serial.print("[WIFI] Connecting to SSID: ");
+  Serial.println(WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n[WIFI] Connected successfully!");
+    Serial.print("[WIFI] IP Address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\n[WIFI] Initial connection failed. Will attempt auto-reconnect during loop.");
+  }
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  // Task 1: Non-blocking sampling task
+  if (currentMillis - lastSampleTime >= SAMPLE_INTERVAL_MS) {
+    lastSampleTime = currentMillis;
+    sampleSensors();
+  }
+
+  // Task 2: Non-blocking data transmission task
+  if (currentMillis - lastTransmitTime >= TRANSMIT_INTERVAL_MS) {
+    lastTransmitTime = currentMillis;
+    transmitData();
+  }
+}
+[WIFI] Connecting to SSID: FACTORY_WIFI_NET
+......
+[WIFI] Connected successfully!
+[WIFI] IP Address: 192.168.1.145
+[SENSOR] Raw sample validated and added to window buffer.
+[SENSOR] Raw sample validated and added to window buffer.
+[SENSOR] Raw sample validated and added to window buffer.
+[REJECTED] Out-of-range sensor value detected! Raw Vib: 0.12 mm/s | Raw Temp: 999.90 deg C
+[SENSOR] Raw sample validated and added to window buffer.
+[HTTP POST] Sending Payload: {"machine_id":"MCH-01","vibration":1.85,"temperature":44.2}
+[HTTP SUCCESS] Response Code: 201 | Body: {"status":"success","message":"Reading recorded successfully"}

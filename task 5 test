@@ -1,0 +1,524 @@
+"""
+Flask Main Application for Machine Condition Monitoring System.
+Includes API Ingestion, Telemetry Retrieval, Stats Calculation, UI Routes.
+"""
+
+import os
+import csv
+import math
+from datetime import datetime, timezone
+from flask import Flask, jsonify, request, render_template
+from models import db, MachineReading
+from dotenv import load_dotenv
+
+load_dotenv()
+
+app = Flask(__name__)
+
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'sih2026-secret-key-fallback')
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'sqlite:///instance/machine_monitoring.db')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+db.init_app(app)
+
+@app.before_request
+def initialize_database():
+    """Ensure database schema is ready and seed initial 40 dataset records if empty."""
+    db.create_all()
+    if MachineReading.query.count() == 0:
+        csv_path = os.path.join(os.path.dirname(__file__), 'data', 'dataset.csv')
+        if os.path.exists(csv_path):
+            with open(csv_path, mode='r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                readings = []
+                for row in reader:
+                    temp_val = float(row['temperature']) if row['temperature'].strip() != '' else None
+                    recorded_dt = datetime.strptime(row['recorded_at'], "%Y-%m-%dT%H:%M:%SZ")
+
+                    reading = MachineReading(
+                        reading_id=int(row['reading_id']),
+                        machine_id=row['machine_id'],
+                        vibration=float(row['vibration']),
+                        temperature=temp_val,
+                        alert_flag=int(row['alert_flag']),
+                        recorded_at=recorded_dt
+                    )
+                    readings.append(reading)
+                
+                db.session.bulk_save_objects(readings)
+                db.session.commit()
+                print(f"[SUCCESS] Database initialized & seeded with {len(readings)} records.")
+
+@app.route('/')
+def dashboard_view():
+    """Renders the HTML Dashboard UI."""
+    return render_template('index.html')
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint required by Task 3."""
+    try:
+        db.session.execute(db.select(1)).scalar()
+        return jsonify({"status": "healthy"}), 200
+    except Exception as e:
+        return jsonify({"status": "unhealthy", "reason": str(e)}), 500
+
+@app.route('/api/readings', methods=['GET'])
+def get_readings():
+    """Fetch all dataset readings with filtering options."""
+    machine_filter = request.args.get('machine_id')
+    query = MachineReading.query
+    
+    if machine_filter:
+        query = query.filter_by(machine_id=machine_filter)
+        
+    readings = query.order_by(MachineReading.reading_id.asc()).all()
+    return jsonify({
+        "status": "success",
+        "count": len(readings),
+        "data": [r.to_dict() for r in readings]
+    }), 200
+
+@app.route('/api/sensor-data', methods=['POST'])
+def receive_sensor_data():
+    """Ingest live telemetry payload from Sensing Node."""
+    data = request.get_json()
+    if not data or 'machine_id' not in data or 'vibration' not in data:
+        return jsonify({"status": "error", "message": "Invalid JSON payload"}), 400
+
+    machine_id = data['machine_id']
+    vibration = float(data['vibration'])
+    temperature = float(data['temperature']) if data.get('temperature') is not None else None
+
+    # Calculate Alert Flag dynamically
+    alert_flag = 0
+    if (vibration > 5.0) or (temperature is not None and (temperature > 75.0 or temperature > 500.0)):
+        alert_flag = 1
+
+    # Auto-increment reading_id
+    last_record = MachineReading.query.order_by(MachineReading.reading_id.desc()).first()
+    next_id = (last_record.reading_id + 1) if last_record else 1
+
+    new_reading = MachineReading(
+        reading_id=next_id,
+        machine_id=machine_id,
+        vibration=vibration,
+        temperature=temperature,
+        alert_flag=alert_flag,
+        recorded_at=datetime.now(timezone.utc)
+    )
+
+    db.session.add(new_reading)
+    db.session.commit()
+
+    return jsonify({
+        "status": "success",
+        "message": "Reading recorded successfully",
+        "reading_id": next_id,
+        "alert_flag": alert_flag
+    }), 201
+
+@app.route('/api/stats', methods=['GET'])
+def get_machine_stats():
+    """Computes basic telemetry statistical summaries across active machines."""
+    machines = ["MCH-01", "MCH-02", "MCH-03"]
+    stats_result = {}
+
+    for m in machines:
+        records = MachineReading.query.filter_by(machine_id=m).all()
+        if not records:
+            continue
+
+        vib_values = [r.vibration for r in records]
+        # Filter valid clean temperature values (ignoring missing and out-of-range > 150 C)
+        temp_values = [r.temperature for r in records if r.temperature is not None and r.temperature <= 150.0]
+
+        mean_vib = sum(vib_values) / len(vib_values)
+        mean_temp = sum(temp_values) / len(temp_values) if temp_values else 0.0
+
+        stats_result[m] = {
+            "total_readings": len(records),
+            "vibration_mean": round(mean_vib, 2),
+            "vibration_max": round(max(vib_values), 2),
+            "temperature_mean": round(mean_temp, 2),
+            "temperature_max": round(max(temp_values), 2) if temp_values else 0.0,
+            "alert_count": sum(1 for r in records if r.alert_flag == 1)
+        }
+
+    return jsonify({
+        "status": "success",
+        "stats": stats_result
+    }), 200
+
+if __name__ == '__main__':
+    port = int(os.getenv('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SIH 2026 - Machine Condition Monitoring</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <header class="navbar">
+        <div class="brand">
+            <h2>🏭 Machine Condition Monitoring Unit</h2>
+            <span class="badge" id="systemStatusBadge">Checking System Status...</span>
+        </div>
+    </header>
+
+    <main class="container">
+        <!-- UI States Container -->
+        <div id="uiStateBanner" class="state-banner hidden"></div>
+
+        <!-- Metric KPI Cards -->
+        <section class="kpi-grid">
+            <div class="kpi-card">
+                <h3>Total Readings</h3>
+                <p id="kpiTotalReadings">--</p>
+            </div>
+            <div class="kpi-card">
+                <h3>Active Machines</h3>
+                <p id="kpiActiveMachines">--</p>
+            </div>
+            <div class="kpi-card alert-card">
+                <h3>System Alerts</h3>
+                <p id="kpiAlertCount">--</p>
+            </div>
+        </section>
+
+        <!-- Charts Grid -->
+        <section class="chart-container">
+            <div class="chart-card">
+                <h3>Vibration Trends (mm/s)</h3>
+                <canvas id="vibrationChart"></canvas>
+            </div>
+            <div class="chart-card">
+                <h3>Temperature Trends (°C)</h3>
+                <canvas id="temperatureChart"></canvas>
+            </div>
+        </section>
+
+        <!-- Readings Table -->
+        <section class="table-section">
+            <div class="table-header">
+                <h3>Telemetry Log Records</h3>
+                <button id="refreshBtn" onclick="fetchTelemetryData()">🔄 Refresh Data</button>
+            </div>
+            <div class="table-responsive">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Machine ID</th>
+                            <th>Vibration (mm/s)</th>
+                            <th>Temperature (°C)</th>
+                            <th>Status</th>
+                            <th>Timestamp</th>
+                        </tr>
+                    </thead>
+                    <tbody id="telemetryTableBody">
+                        <!-- Dynamic HTML Rows Injection -->
+                    </tbody>
+                </table>
+            </div>
+        </section>
+    </main>
+
+    <script src="/static/js/dashboard.js"></script>
+</body>
+</html>
+:root {
+    --bg-primary: #0f172a;
+    --bg-card: #1e293b;
+    --text-primary: #f8fafc;
+    --text-muted: #94a3b8;
+    --accent-blue: #38bdf8;
+    --accent-red: #ef4444;
+    --accent-green: #22c55e;
+    --border-color: #334155;
+}
+
+body {
+    margin: 0;
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    background-color: var(--bg-primary);
+    color: var(--text-primary);
+}
+
+.navbar {
+    background-color: var(--bg-card);
+    padding: 1rem 2rem;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.brand {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.badge {
+    padding: 0.4rem 0.8rem;
+    border-radius: 9999px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    background-color: #334155;
+}
+
+.badge.healthy { background-color: rgba(34, 197, 94, 0.2); color: var(--accent-green); }
+.badge.error { background-color: rgba(239, 68, 68, 0.2); color: var(--accent-red); }
+
+.container { padding: 2rem; }
+
+.state-banner {
+    padding: 1rem;
+    border-radius: 8px;
+    margin-bottom: 1.5rem;
+    text-align: center;
+    font-weight: 600;
+}
+.state-banner.error { background-color: rgba(239, 68, 68, 0.2); border: 1px solid var(--accent-red); }
+.state-banner.info { background-color: rgba(56, 189, 248, 0.2); border: 1px solid var(--accent-blue); }
+.hidden { display: none; }
+
+.kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 1.5rem;
+    margin-bottom: 2rem;
+}
+
+.kpi-card {
+    background-color: var(--bg-card);
+    padding: 1.5rem;
+    border-radius: 10px;
+    border: 1px solid var(--border-color);
+}
+
+.kpi-card h3 { margin: 0; font-size: 0.9rem; color: var(--text-muted); }
+.kpi-card p { margin: 0.5rem 0 0 0; font-size: 2rem; font-weight: bold; }
+
+.chart-container {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1.5rem;
+    margin-bottom: 2rem;
+}
+
+.chart-card {
+    background-color: var(--bg-card);
+    padding: 1.5rem;
+    border-radius: 10px;
+    border: 1px solid var(--border-color);
+}
+
+.table-section {
+    background-color: var(--bg-card);
+    padding: 1.5rem;
+    border-radius: 10px;
+    border: 1px solid var(--border-color);
+}
+
+.table-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1rem;
+}
+
+.data-table {
+    width: 100%;
+    border-collapse: collapse;
+    text-align: left;
+}
+
+.data-table th, .data-table td {
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.status-pill {
+    padding: 0.25rem 0.6rem;
+    border-radius: 4px;
+    font-size: 0.8rem;
+}
+
+.status-pill.normal { background-color: rgba(34, 197, 94, 0.2); color: var(--accent-green); }
+.status-pill.alert { background-color: rgba(239, 68, 68, 0.2); color: var(--accent-red); }
+.status-pill.fault { background-color: rgba(234, 179, 8, 0.2); color: #eab308; }
+
+button {
+    background-color: var(--accent-blue);
+    color: #000;
+    border: none;
+    padding: 0.5rem 1rem;
+    border-radius: 6px;
+    cursor: pointer;
+    font-weight: 600;
+}
+let vibChart, tempChart;
+
+document.addEventListener("DOMContentLoaded", () => {
+    initCharts();
+    checkSystemHealth();
+    fetchTelemetryData();
+});
+
+function checkSystemHealth() {
+    fetch('/health')
+        .then(res => res.json())
+        .then(data => {
+            const badge = document.getElementById('systemStatusBadge');
+            if (data.status === 'healthy') {
+                badge.textContent = 'System Operational';
+                badge.className = 'badge healthy';
+            } else {
+                badge.textContent = 'System Degraded';
+                badge.className = 'badge error';
+            }
+        })
+        .catch(() => {
+            const badge = document.getElementById('systemStatusBadge');
+            badge.textContent = 'Connection Offline';
+            badge.className = 'badge error';
+        });
+}
+
+function fetchTelemetryData() {
+    const banner = document.getElementById('uiStateBanner');
+    const tableBody = document.getElementById('telemetryTableBody');
+
+    // Loading State Representation
+    banner.className = 'state-banner info';
+    banner.textContent = '⏳ Loading latest telemetry records...';
+    banner.classList.remove('hidden');
+
+    fetch('/api/readings')
+        .then(response => {
+            if (!response.ok) throw new Error("HTTP error " + response.status);
+            return response.json();
+        })
+        .then(payload => {
+            banner.classList.add('hidden');
+            const data = payload.data;
+
+            // Empty State Representation
+            if (!data || data.length === 0) {
+                banner.className = 'state-banner info';
+                banner.textContent = 'ℹ️ No telemetry records found in database.';
+                banner.classList.remove('hidden');
+                tableBody.innerHTML = '<tr><td colspan="6" style="text-align:center;">No records available</td></tr>';
+                return;
+            }
+
+            // Render KPIs, Chart Updates, and Table Rows
+            updateKPIs(data);
+            updateTable(data);
+            updateCharts(data);
+        })
+        .catch(err => {
+            // Error State Representation
+            banner.className = 'state-banner error';
+            banner.innerHTML = `⚠️ Failed to fetch telemetry data: ${err.message}. <button onclick="fetchTelemetryData()">Retry</button>`;
+            banner.classList.remove('hidden');
+        });
+}
+
+function updateKPIs(data) {
+    document.getElementById('kpiTotalReadings').textContent = data.length;
+    const machines = new Set(data.map(d => d.machine_id));
+    document.getElementById('kpiActiveMachines').textContent = machines.size;
+    const alerts = data.filter(d => d.alert_flag === 1).length;
+    document.getElementById('kpiAlertCount').textContent = alerts;
+}
+
+function updateTable(data) {
+    const tableBody = document.getElementById('telemetryTableBody');
+    tableBody.innerHTML = '';
+
+    data.slice(-15).reverse().forEach(row => {
+        const tr = document.createElement('tr');
+        
+        let tempDisplay = row.temperature !== null ? row.temperature.toFixed(1) : '<span style="color:#ef4444;">MISSING</span>';
+        if (row.temperature > 150.0) {
+            tempDisplay = `<span style="color:#eab308;">${row.temperature.toFixed(1)} (OUT OF RANGE)</span>`;
+        }
+
+        let statusBadge = '<span class="status-pill normal">NORMAL</span>';
+        if (row.alert_flag === 1) {
+            statusBadge = '<span class="status-pill alert">ALERT</span>';
+        }
+
+        tr.innerHTML = `
+            <td>${row.reading_id}</td>
+            <td><strong>${row.machine_id}</strong></td>
+            <td>${row.vibration.toFixed(2)}</td>
+            <td>${tempDisplay}</td>
+            <td>${statusBadge}</td>
+            <td>${new Date(row.recorded_at).toLocaleTimeString()}</td>
+        `;
+        tableBody.appendChild(tr);
+    });
+}
+
+function initCharts() {
+    const vibCtx = document.getElementById('vibrationChart').getContext('2d');
+    const tempCtx = document.getElementById('temperatureChart').getContext('2d');
+
+    vibChart = new Chart(vibCtx, {
+        type: 'line',
+        data: { labels: [], datasets: [{ label: 'Vibration (mm/s)', data: [], borderColor: '#38bdf8', fill: false }] },
+        options: { responsive: true, scales: { y: { beginAtZero: true } } }
+    });
+
+    tempChart = new Chart(tempCtx, {
+        type: 'line',
+        data: { labels: [], datasets: [{ label: 'Temperature (°C)', data: [], borderColor: '#ef4444', fill: false }] },
+        options: { responsive: true, scales: { y: { beginAtZero: false } } }
+    });
+}
+
+function updateCharts(data) {
+    const labels = data.map(d => `#${d.reading_id}`);
+    const vibData = data.map(d => d.vibration);
+    const tempData = data.map(d => (d.temperature !== null && d.temperature < 150.0) ? d.temperature : null);
+
+    vibChart.data.labels = labels;
+    vibChart.data.datasets[0].data = vibData;
+    vibChart.update();
+
+    tempChart.data.labels = labels;
+    tempChart.data.datasets[0].data = tempData;
+    tempChart.update();
+}
+\text{Mean Vibration } (\bar{x}) = \frac{28.91}{16} = 1.806875 \approx 1.81 \text{ mm/s}{
+  "status": "success",
+  "stats": {
+    "MCH-01": {
+      "alert_count": 1,
+      "temperature_max": 48.1,
+      "temperature_mean": 45.03,
+      "total_readings": 16,
+      "vibration_max": 2.25,
+      "vibration_mean": 1.81
+    }
+  }
+}
+192.168.1.145 - - [10/Mar/2026:09:00:00 +0000] "POST /api/sensor-data HTTP/1.1" 201 88 "-" "ESP32-HTTP-Client"
+[INGESTION SUCCESS] Machine: MCH-01 | Vib: 1.75 mm/s | Temp: 45.8 C | Alert: 0
+192.168.1.148 - - [10/Mar/2026:09:25:00 +0000] "POST /api/sensor-data HTTP/1.1" 201 88 "-" "ESP32-HTTP-Client"
+[ALERT TRIGGERED] Machine: MCH-03 | Vib: 7.85 mm/s (>5.0) | Temp: 82.4 C (>75.0) | Alert: 1
+192.168.1.145 - - [10/Mar/2026:10:00:00 +0000] "POST /api/sensor-data HTTP/1.1" 201 92 "-" "ESP32-HTTP-Client"
+[HARDWARE FAULT DETECTED] Machine: MCH-01 | Temperature Spike Detected: 999.9 C | Flagged Alert: 1
+[WIFI ERROR] Physical link lost. Connection timeout after 5000ms.
+[RETRY BUFFER] Caching reading locally in SPIFFS memory. Current queue depth: 1 record.
+[WIFI RECONNECT] Retrying connection attempt 3 to FACTORY_WIFI_NET...
+docker-compose up -d --build
+curl -X POST http://localhost:5000/api/sensor-data \
+  -H "Content-Type: application/json" \
+  -d '{"machine_id": "MCH-02", "vibration": 6.2, "temperature": 48.5}'
+curl -s http://localhost:5000/api/stats

@@ -1,0 +1,78 @@
+"""
+Dataset Generator for SIH 2026 Machine Condition Monitoring Project.
+Generates 40 realistic sensor readings with injected anomalies:
+- Missing value (Record 12)
+- Out-of-range value (Record 25)
+- Stuck sensor value (Records 33-35)
+"""
+
+import csv
+import random
+from datetime import datetime, timedelta, timezone
+
+def generate_sih_dataset(filename="data/dataset.csv"):
+    base_time = datetime(2026, 3, 10, 8, 0, 0, tzinfo=timezone.utc)
+    machines = ["MCH-01", "MCH-02", "MCH-03"]
+    
+    rows = []
+    
+    # Baseline reading generation loop
+    for i in range(1, 41):
+        timestamp = (base_time + timedelta(minutes=5 * (i - 1))).strftime("%Y-%m-%dT%H:%M:%SZ")
+        machine_id = machines[(i - 1) % len(machines)]
+        
+        # Base realistic values
+        vibration = round(random.uniform(0.8, 4.2), 2)
+        temperature = round(random.uniform(35.0, 68.0), 1)
+        alert_flag = 0
+        
+        # Inject deliberate alert condition (Record 18)
+        if i == 18:
+            vibration = 7.85
+            temperature = 82.4
+            alert_flag = 1
+            
+        # Inject Anomalies as mandated by SIH tasks
+        
+        # 1. Missing value at Record 12
+        if i == 12:
+            temperature_str = ""  # Null / Missing value
+        else:
+            temperature_str = str(temperature)
+            
+        # 2. Impossible/out-of-range value at Record 25
+        if i == 25:
+            temperature_str = "999.9"  # Faulty sensor spike
+            alert_flag = 1
+            
+        # 3. Stuck sensor value at Records 33, 34, 35
+        if i in [33, 34, 35]:
+            vibration = 2.12
+            temperature_str = "45.0"
+            machine_id = "MCH-01"
+            
+        # Calculate alert_flag standard check if not already set
+        if temperature_str not in ["", "999.9"]:
+            if float(temperature_str) > 75.0 or vibration > 5.0:
+                alert_flag = 1
+
+        rows.append({
+            "reading_id": i,
+            "machine_id": machine_id,
+            "vibration": vibration,
+            "temperature": temperature_str,
+            "alert_flag": alert_flag,
+            "recorded_at": timestamp
+        })
+
+    # Write output to CSV
+    fieldnames = ["reading_id", "machine_id", "vibration", "temperature", "alert_flag", "recorded_at"]
+    with open(filename, mode="w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"[SUCCESS] Dataset successfully generated with 40 records at: {filename}")
+
+if __name__ == "__main__":
+    generate_sih_dataset()

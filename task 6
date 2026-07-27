@@ -1,0 +1,21 @@
+git clone [https://github.com/your-org/sih2026-machine-monitoring.git](https://github.com/your-org/sih2026-machine-monitoring.git)
+cd sih2026-machine-monitoring
+python3 -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+pip install -r requirements.txt
+python data/generate_dataset.py
+python app.py
+docker-compose up -d --build
+docker-compose ps
+docker-compose logs -f web
+docker-compose down
+Endpoint Method Description Sample Response Body
+/health GET Health check endpoint {"status": "healthy"}
+/api/readings GET Fetch all machine readings {"status": "success", "count": 40, "data": [...]}
+/api/sensor-data POST Ingest edge telemetry {"status": "success", "reading_id": 41, "alert_flag": 0}
+/api/stats GET Get machine statistics {"status": "success", "stats": {"MCH-01": {...}}}Task Requirement Status Verification Reference
+Task 1 Generate dataset of ~40 machine readings COMPLETED data/dataset.csv (40 rows)
+Task 1 Include missing value, out-of-range value, stuck sensor COMPLETED Rows 12 (missing), 25 (spike), 33-35 (stuck)
+Task 2 Generate Dockerfile, .dockerignore, requirements.txt, .env.example COMPLETED Complete task files provided in Task 2
+Task 2 Install dependencies before copying source; keep secrets out COMPLETED Structured layering in Dockerfile
+Task 3 Docker Compose setup & GET /health returning {"status":"healthy"} COMPLETED docker-compose.yml & app.py /health route
